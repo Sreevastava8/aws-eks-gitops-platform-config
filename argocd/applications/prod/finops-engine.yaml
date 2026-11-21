@@ -1,0 +1,36 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+
+metadata:
+  name: finops-prod
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+
+spec:
+  project: finops-prod
+
+  source:
+    repoURL: <REPLACE_WITH_GITOPS_REPO_URL>
+    targetRevision: HEAD
+    path: applications/finops-engine/chart
+
+    helm:
+      releaseName: finops-engine
+      valueFiles:
+        - values.yaml
+        - values-prod.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: finops-prod
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
+      

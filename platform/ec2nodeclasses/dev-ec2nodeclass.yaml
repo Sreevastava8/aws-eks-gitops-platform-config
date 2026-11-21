@@ -1,0 +1,26 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+
+metadata:
+  name: dev
+  labels:
+    environment: dev
+
+spec:
+  role: "gitops-karpenter-finops-engine-dev-karpenter-node-role"
+
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: gitops-karpenter-finops-dev
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: gitops-karpenter-finops-dev
+
+  amiSelectorTerms:
+    - alias: al2023@latest
+
+  tags:
+    Project: gitops-karpenter-finops-engine
+    Environment: dev
+    ManagedBy: Karpenter

@@ -1,0 +1,28 @@
+---
+# Common Karpenter Helm configuration.
+# Shared by DEV, QA and PROD environments.
+
+replicas: 2
+
+# Environment-specific managed node-group selection
+# is configured in each environment values file.
+nodeSelector:
+  kubernetes.io/os: linux
+
+controller:
+  resources:
+    requests:
+      cpu: 1
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 1Gi
+
+logLevel: info
+
+# AWS authentication uses EKS Pod Identity.
+# Do not configure IRSA annotations here.
+serviceAccount:
+  create: true
+  name: karpenter
+  annotations: {}

@@ -1,0 +1,27 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+
+metadata:
+  name: karpenter-nodepool-prod
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+
+spec:
+  project: finops-prod
+
+  source:
+    repoURL: <REPLACE_WITH_GITOPS_REPO_URL>
+    targetRevision: HEAD
+    path: platform/nodepools
+    directory:
+      include: prod-nodepool.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

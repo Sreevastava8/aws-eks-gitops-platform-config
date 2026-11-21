@@ -1,0 +1,91 @@
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: {{ include "finops-engine.fullname" . }}
+  labels:
+    {{- include "finops-engine.labels" . | nindent 4 }}
+
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "finops-engine.selectorLabels" . | nindent 6 }}
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # -----------------------------------------------
+  # INGRESS
+  # -----------------------------------------------
+
+  ingress:
+
+    # Allow internal application communication.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+
+    # Allow Prometheus to scrape application metrics.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+
+  # -----------------------------------------------
+  # EGRESS
+  # -----------------------------------------------
+
+  egress:
+
+    # DNS resolution through CoreDNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Allow communication with Prometheus.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+
+    # AWS Cost Explorer HTTPS API access.
+    #
+    # Standard Kubernetes NetworkPolicy cannot restrict
+    # traffic by DNS hostname.
+    #
+    # This permits outbound IPv4 HTTPS traffic.
+    # Restrict further using an egress proxy or
+    # AWS network firewall if required.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # EKS Pod Identity credential endpoint.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - protocol: TCP
+          port: 80
+
+{{- end }}

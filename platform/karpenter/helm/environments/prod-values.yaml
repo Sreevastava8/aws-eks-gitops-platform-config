@@ -1,0 +1,9 @@
+---
+settings:
+  clusterName: gitops-karpenter-finops-prod
+  clusterEndpoint: "REPLACE_WITH_PROD_EKS_CLUSTER_ENDPOINT"
+  interruptionQueue: "REPLACE_WITH_PROD_KARPENTER_QUEUE_NAME"
+
+nodeSelector:
+  kubernetes.io/os: linux
+  eks.amazonaws.com/nodegroup: gitops-karpenter-finops-prod-system

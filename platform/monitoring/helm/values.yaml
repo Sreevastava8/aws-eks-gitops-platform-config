@@ -1,0 +1,123 @@
+---
+# GitOps Karpenter FinOps Engine
+# Monitoring configuration
+# Helm chart: kube-prometheus-stack
+# Chart version: 92.13.1
+
+# --------------------------------------------------
+# PROMETHEUS OPERATOR
+# --------------------------------------------------
+
+prometheusOperator:
+  enabled: true
+
+# --------------------------------------------------
+# PROMETHEUS
+# --------------------------------------------------
+
+prometheus:
+  enabled: true
+
+  prometheusSpec:
+    replicas: 1
+
+    retention: 15d
+    retentionSize: 15GB
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+    # Persistent storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 30Gi
+              
+
+    # Discover ServiceMonitors across namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+
+    # Discover PodMonitors across namespaces
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+
+# --------------------------------------------------
+# GRAFANA
+# --------------------------------------------------
+
+grafana:
+  enabled: true
+
+  replicas: 1
+
+  admin:
+    existingSecret: grafana-admin-credentials
+
+  adminUserKey: admin-user
+  adminPasswordKey: admin-password
+
+  persistence:
+    enabled: true
+    type: sts
+    size: 10Gi
+    storageClassName: gp3
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# --------------------------------------------------
+# ALERTMANAGER
+# --------------------------------------------------
+
+alertmanager:
+  enabled: true
+
+  alertmanagerSpec:
+    replicas: 1
+
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+
+# --------------------------------------------------
+# KUBERNETES STATE METRICS
+# --------------------------------------------------
+
+kubeStateMetrics:
+  enabled: true
+
+# --------------------------------------------------
+# NODE EXPORTER
+# --------------------------------------------------
+
+nodeExporter:
+  enabled: true
+
+# --------------------------------------------------
+# DEFAULT ALERTING RULES
+# --------------------------------------------------
+
+defaultRules:
+  create: true

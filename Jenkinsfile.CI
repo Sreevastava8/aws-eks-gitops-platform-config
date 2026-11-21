@@ -1,0 +1,1128 @@
+pipeline {
+
+    agent {
+        label 'gitops-ci'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+
+        buildDiscarder(logRotator(
+            numToKeepStr: '30',
+            artifactNumToKeepStr: '20'
+        ))
+
+        skipDefaultCheckout(true)
+        ansiColor('xterm')
+    }
+
+    environment {
+        PYTHONUNBUFFERED = '1'
+
+        FINOPS_CHART = 'applications/finops-engine/chart'
+        MONITORING_VALUES = 'platform/monitoring/helm/values.yaml'
+
+        KUSTOMIZE_BASE = 'platform/external-secrets'
+
+        MONITORING_CHART_VERSION = '92.13.1'
+        KARPENTER_CHART_VERSION = '1.15.1'
+
+        REPORT_DIR = 'ci-reports'
+    }
+
+    stages {
+
+        // ================================================
+        // 1. CHECKOUT
+        // ================================================
+
+        stage('Checkout GitOps Repository') {
+
+            steps {
+                cleanWs()
+
+                checkout scm
+
+                sh '''
+                    set -eu
+
+                    echo "Repository checkout completed"
+
+                    echo "Commit:"
+                    git rev-parse HEAD
+
+                    echo "Branch:"
+                    git branch --show-current
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 2. TOOL VALIDATION
+        // ================================================
+
+        stage('Validate CI Toolchain') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking required tools..."
+
+                    for tool in \
+                        python3 \
+                        helm \
+                        kustomize \
+                        kubeconform \
+                        conftest \
+                        gitleaks \
+                        trivy
+                    do
+
+                        if ! command -v "$tool" >/dev/null 2>&1; then
+                            echo "ERROR: Missing tool: $tool"
+                            exit 1
+                        fi
+
+                        echo "PASS: $tool"
+
+                    done
+
+                    python3 -c "import yaml; print('PASS: PyYAML')"
+
+                    helm version --short
+                    kustomize version
+                    kubeconform -v
+                    conftest --version
+                    gitleaks version
+                    trivy --version
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 3. YAML SYNTAX VALIDATION
+        // ================================================
+
+        stage('YAML Syntax Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    python3 - <<'PY'
+import yaml
+from pathlib import Path
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def construct_mapping(loader, node, deep=False):
+
+    mapping = {}
+
+    for key_node, value_node in node.value:
+
+        key = loader.construct_object(
+            key_node,
+            deep=deep
+        )
+
+        if key in mapping:
+            raise ValueError(
+                f"Duplicate YAML key: {key}"
+            )
+
+        mapping[key] = loader.construct_object(
+            value_node,
+            deep=deep
+        )
+
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_mapping
+)
+
+
+excluded = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "ci-reports",
+    "__pycache__"
+}
+
+
+files = []
+
+for path in Path(".").rglob("*"):
+
+    if not path.is_file():
+        continue
+
+    if any(part in excluded for part in path.parts):
+        continue
+
+    # Helm templates are validated after rendering.
+    if "templates" in path.parts:
+        continue
+
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        files.append(path)
+
+
+if not files:
+    raise SystemExit("No YAML files found")
+
+
+errors = []
+
+for path in sorted(files):
+
+    try:
+
+        with path.open(encoding="utf-8") as stream:
+
+            list(
+                yaml.load_all(
+                    stream,
+                    Loader=UniqueKeyLoader
+                )
+            )
+
+        print(f"PASS: {path}")
+
+    except Exception as exc:
+
+        errors.append(
+            f"{path}: {exc}"
+        )
+
+
+if errors:
+
+    print("\\nYAML validation failures:")
+
+    for error in errors:
+        print(error)
+
+    raise SystemExit(1)
+
+
+print(
+    f"\\nPASS: {len(files)} YAML files validated"
+)
+PY
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 4. EXTERNAL SECRETS VALIDATION
+        // ================================================
+
+        stage('External Secrets Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    python3 - <<'PY'
+import yaml
+from pathlib import Path
+
+
+# Inspect Kubernetes YAML manifests only.
+# Helm templates are excluded because they are
+# rendered and validated in their dedicated stages.
+
+scan_roots = [
+    Path("argocd"),
+    Path("bootstrap"),
+    Path("platform")
+]
+
+
+for root in scan_roots:
+
+    if not root.exists():
+        continue
+
+    for path in root.rglob("*"):
+
+        if not path.is_file():
+            continue
+
+        if "templates" in path.parts:
+            continue
+
+        if path.suffix.lower() not in {".yaml", ".yml"}:
+            continue
+
+        with path.open(encoding="utf-8") as stream:
+
+            documents = yaml.safe_load_all(stream)
+
+            for doc in documents:
+
+                if not isinstance(doc, dict):
+                    continue
+
+                if doc.get("kind") != "Secret":
+                    continue
+
+                secret_data = doc.get("data") or {}
+
+                secret_string_data = (
+                    doc.get("stringData") or {}
+                )
+
+                if secret_data or secret_string_data:
+
+                    raise SystemExit(
+                        f"FAIL: Embedded Secret values in {path}"
+                    )
+
+
+# Validate External Secrets resources.
+
+for env in ["dev", "qa", "prod"]:
+
+    base = Path(
+        f"platform/external-secrets/environments/{env}"
+    )
+
+    required = [
+        "namespaces.yaml",
+        "externalsecret.yaml",
+        "grafana-externalsecret.yaml",
+        "kustomization.yaml"
+    ]
+
+    for filename in required:
+
+        path = base / filename
+
+        if not path.exists():
+
+            raise SystemExit(
+                f"Missing file: {path}"
+            )
+
+
+    with (
+        base / "kustomization.yaml"
+    ).open(encoding="utf-8") as stream:
+
+        config = yaml.safe_load(stream)
+
+
+    resources = config.get("resources", [])
+
+
+    for filename in required[:3]:
+
+        if filename not in resources:
+
+            raise SystemExit(
+                f"{env}: {filename} missing from Kustomization"
+            )
+
+
+    print(
+        f"PASS: {env.upper()} External Secrets"
+    )
+
+
+print("PASS: External Secrets validation")
+print("PASS: No embedded Kubernetes Secret values")
+PY
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 5. KUSTOMIZE VALIDATION
+        // ================================================
+
+        stage('Kustomize Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    for ENV in dev qa prod
+                    do
+
+                        echo "Validating $ENV"
+
+                        SOURCE="$KUSTOMIZE_BASE/environments/$ENV"
+
+                        kustomize build "$SOURCE" \
+                            > "$REPORT_DIR/external-secrets-$ENV.yaml"
+
+                        test -s "$REPORT_DIR/external-secrets-$ENV.yaml"
+
+                        echo "PASS: $ENV Kustomize"
+
+                    done
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 6. FINOPS HELM VALIDATION
+        // ================================================
+
+        stage('FinOps Helm Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    for ENV in dev qa prod
+                    do
+
+                        echo "Validating FinOps $ENV"
+
+                        VALUES="$FINOPS_CHART/values-$ENV.yaml"
+
+                        helm lint "$FINOPS_CHART" \
+                            -f "$VALUES"
+
+                        helm template finops-engine "$FINOPS_CHART" \
+                            --namespace "finops-$ENV" \
+                            -f "$VALUES" \
+                            > "$REPORT_DIR/finops-$ENV-rendered.yaml"
+
+                        test -s "$REPORT_DIR/finops-$ENV-rendered.yaml"
+
+                        echo "PASS: FinOps $ENV"
+
+                    done
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 7. MONITORING HELM VALIDATION
+        // ================================================
+
+        stage('Monitoring Helm Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    helm repo add prometheus-community \
+                        https://prometheus-community.github.io/helm-charts \
+                        --force-update
+
+                    helm repo update
+
+                    helm lint prometheus-community/kube-prometheus-stack \
+                        --version "$MONITORING_CHART_VERSION" \
+                        -f "$MONITORING_VALUES"
+
+                    helm template monitoring \
+                        prometheus-community/kube-prometheus-stack \
+                        --version "$MONITORING_CHART_VERSION" \
+                        --namespace monitoring \
+                        -f "$MONITORING_VALUES" \
+                        > "$REPORT_DIR/monitoring-rendered.yaml"
+
+                    test -s "$REPORT_DIR/monitoring-rendered.yaml"
+
+                    echo "PASS: Monitoring Helm"
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 8. KARPENTER HELM VALIDATION
+        // ================================================
+
+        stage('Karpenter Helm Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    for ENV in dev qa prod
+                    do
+
+                        echo "Rendering Karpenter for $ENV"
+
+                        helm template karpenter \
+                            oci://public.ecr.aws/karpenter/karpenter \
+                            --version "$KARPENTER_CHART_VERSION" \
+                            --namespace karpenter \
+                            -f platform/karpenter/helm/values.yaml \
+                            -f "platform/karpenter/helm/environments/$ENV-values.yaml" \
+                            > "$REPORT_DIR/karpenter-$ENV-rendered.yaml"
+
+                        test -s "$REPORT_DIR/karpenter-$ENV-rendered.yaml"
+
+                        echo "PASS: Karpenter $ENV"
+
+                    done
+
+                    echo "PASS: Karpenter Helm rendering"
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 9. KUBERNETES SCHEMA VALIDATION
+        // ================================================
+
+        stage('Kubernetes Schema Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    for FILE in \
+                        "$REPORT_DIR/finops-dev-rendered.yaml" \
+                        "$REPORT_DIR/finops-qa-rendered.yaml" \
+                        "$REPORT_DIR/finops-prod-rendered.yaml" \
+                        "$REPORT_DIR/monitoring-rendered.yaml" \
+                        "$REPORT_DIR/external-secrets-dev.yaml" \
+                        "$REPORT_DIR/external-secrets-qa.yaml" \
+                        "$REPORT_DIR/external-secrets-prod.yaml" \
+                        "$REPORT_DIR/karpenter-dev-rendered.yaml" \
+                        "$REPORT_DIR/karpenter-qa-rendered.yaml" \
+                        "$REPORT_DIR/karpenter-prod-rendered.yaml"
+                    do
+
+                        echo "Schema validation: $FILE"
+
+                        kubeconform \
+                            -strict \
+                            -summary \
+                            -ignore-missing-schemas \
+                            "$FILE"
+
+                    done
+
+                    echo "PASS: Supported Kubernetes schema validation"
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 10. KARPENTER RESOURCE VALIDATION
+        // ================================================
+
+        stage('Karpenter Resource Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    python3 - <<'PY'
+import yaml
+from pathlib import Path
+
+
+environments = ["dev", "qa", "prod"]
+
+
+for env in environments:
+
+    nodepool = Path(
+        f"platform/nodepools/{env}-nodepool.yaml"
+    )
+
+    nodeclass = Path(
+        f"platform/ec2nodeclasses/{env}-ec2nodeclass.yaml"
+    )
+
+
+    # Check required files.
+
+    for path in [nodepool, nodeclass]:
+
+        if not path.exists():
+
+            raise SystemExit(
+                f"Missing file: {path}"
+            )
+
+
+    # Load YAML resources.
+
+    with nodepool.open(encoding="utf-8") as stream:
+        pool = yaml.safe_load(stream)
+
+    with nodeclass.open(encoding="utf-8") as stream:
+        ec2 = yaml.safe_load(stream)
+
+
+    # Validate resource structure.
+
+    if not isinstance(pool, dict):
+        raise SystemExit(f"{env}: Invalid NodePool YAML")
+
+    if not isinstance(ec2, dict):
+        raise SystemExit(f"{env}: Invalid EC2NodeClass YAML")
+
+
+    # Validate NodePool.
+
+    assert pool.get("kind") == "NodePool", \
+        f"{env}: Expected NodePool"
+
+    assert pool.get("apiVersion") == "karpenter.sh/v1", \
+        f"{env}: Incorrect NodePool apiVersion"
+
+    assert pool.get("metadata", {}).get("name"), \
+        f"{env}: NodePool metadata.name missing"
+
+    pool_spec = pool.get("spec", {})
+
+    template_spec = (
+        pool_spec.get("template", {}).get("spec", {})
+    )
+
+    node_class_ref = template_spec.get("nodeClassRef", {})
+
+    assert node_class_ref.get("group") == "karpenter.k8s.aws", \
+        f"{env}: Incorrect NodePool nodeClassRef group"
+
+    assert node_class_ref.get("kind") == "EC2NodeClass", \
+        f"{env}: Incorrect NodePool nodeClassRef kind"
+
+    assert node_class_ref.get("name") == ec2.get(
+        "metadata", {}
+    ).get("name"), \
+        f"{env}: NodePool references wrong EC2NodeClass"
+
+    assert pool_spec.get("limits"), \
+        f"{env}: NodePool limits missing"
+
+    assert pool_spec.get("disruption"), \
+        f"{env}: NodePool disruption settings missing"
+
+
+    # Validate EC2NodeClass.
+
+    assert ec2.get("kind") == "EC2NodeClass", \
+        f"{env}: Expected EC2NodeClass"
+
+    assert ec2.get("apiVersion") == "karpenter.k8s.aws/v1", \
+        f"{env}: Incorrect EC2NodeClass apiVersion"
+
+    ec2_spec = ec2.get("spec", {})
+
+    assert ec2_spec.get("role"), \
+        f"{env}: EC2NodeClass IAM role missing"
+
+    assert ec2_spec.get("amiSelectorTerms"), \
+        f"{env}: AMI selectors missing"
+
+    assert ec2_spec.get("subnetSelectorTerms"), \
+        f"{env}: Subnet selectors missing"
+
+    assert ec2_spec.get("securityGroupSelectorTerms"), \
+        f"{env}: Security group selectors missing"
+
+
+    print(
+        f"PASS: {env.upper()} NodePool and EC2NodeClass"
+    )
+
+
+print("PASS: All Karpenter resource checks")
+PY
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 11. ARGO CD CONFIGURATION VALIDATION
+        // ================================================
+
+        stage('Argo CD Configuration Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    python3 - <<'PY'
+import yaml
+from pathlib import Path
+
+
+environments = ["dev", "qa", "prod"]
+
+
+# Validate AppProjects.
+
+for env in environments:
+
+    path = Path(
+        f"argocd/projects/{env}-project.yaml"
+    )
+
+    if not path.exists():
+        raise SystemExit(f"Missing AppProject: {path}")
+
+    with path.open(encoding="utf-8") as stream:
+        data = yaml.safe_load(stream)
+
+    assert data.get("kind") == "AppProject"
+
+    assert data["metadata"]["name"] == f"finops-{env}"
+
+    assert data["spec"].get("sourceRepos")
+
+    assert data["spec"].get("destinations")
+
+    print(f"PASS: {env.upper()} AppProject")
+
+
+# Validate root Applications.
+
+for env in environments:
+
+    path = Path(
+        f"argocd/app-of-apps/{env}-apps.yaml"
+    )
+
+    if not path.exists():
+        raise SystemExit(f"Missing root Application: {path}")
+
+    with path.open(encoding="utf-8") as stream:
+        data = yaml.safe_load(stream)
+
+    assert data.get("kind") == "Application"
+
+    assert data["spec"].get("project") == f"finops-{env}"
+
+    assert data["spec"].get("destination")
+
+    assert (
+        data["spec"].get("source")
+        or data["spec"].get("sources")
+    )
+
+    print(f"PASS: {env.upper()} root Application")
+
+
+# Validate child Applications.
+
+for env in environments:
+
+    directory = Path(
+        f"argocd/applications/{env}"
+    )
+
+    applications = sorted(
+        directory.glob("*.yaml")
+    )
+
+    if len(applications) != 9:
+
+        raise SystemExit(
+            f"{env}: Expected 9 child Applications, "
+            f"found {len(applications)}"
+        )
+
+
+    for path in applications:
+
+        with path.open(encoding="utf-8") as stream:
+            data = yaml.safe_load(stream)
+
+        assert data.get("kind") == "Application", path
+
+        assert data["metadata"].get("name"), path
+
+        spec = data.get("spec", {})
+
+        assert spec.get("project") == f"finops-{env}", path
+
+        assert spec.get("destination"), path
+
+        assert (
+            spec.get("source")
+            or spec.get("sources")
+        ), path
+
+
+    print(
+        f"PASS: {env.upper()} child Applications "
+        f"({len(applications)})"
+    )
+
+
+print("PASS: Argo CD static configuration")
+PY
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 12. FINOPS SECURITY VALIDATION
+        // ================================================
+
+        stage('FinOps Security Validation') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    python3 - <<'PY'
+import yaml
+from pathlib import Path
+
+
+for env in ["dev", "qa", "prod"]:
+
+    path = Path(
+        f"ci-reports/finops-{env}-rendered.yaml"
+    )
+
+    with path.open(encoding="utf-8") as stream:
+        documents = list(yaml.safe_load_all(stream))
+
+
+    deployments = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+    ]
+
+
+    if not deployments:
+
+        raise SystemExit(
+            f"{env}: No Deployment rendered"
+        )
+
+
+    for deployment in deployments:
+
+        pod_spec = (
+            deployment["spec"]["template"]["spec"]
+        )
+
+        pod_security = pod_spec.get(
+            "securityContext", {}
+        )
+
+        assert pod_security.get("runAsNonRoot") is True, \
+            f"{env}: runAsNonRoot missing"
+
+
+        containers = pod_spec.get(
+            "containers", []
+        )
+
+
+        for container in containers:
+
+            security = container.get(
+                "securityContext", {}
+            )
+
+            assert security.get(
+                "allowPrivilegeEscalation"
+            ) is False, \
+                f"{env}: Privilege escalation enabled"
+
+            assert security.get(
+                "readOnlyRootFilesystem"
+            ) is True, \
+                f"{env}: Root filesystem is not read-only"
+
+
+            capabilities = security.get(
+                "capabilities", {}
+            )
+
+            assert "ALL" in capabilities.get(
+                "drop", []
+            ), \
+                f"{env}: Linux capabilities not dropped"
+
+
+            resources = container.get(
+                "resources", {}
+            )
+
+            assert resources.get(
+                "requests", {}
+            ).get("cpu"), \
+                f"{env}: CPU request missing"
+
+            assert resources.get(
+                "limits", {}
+            ).get("memory"), \
+                f"{env}: Memory limit missing"
+
+
+    print(
+        f"PASS: {env.upper()} rendered Deployment security"
+    )
+
+
+print("PASS: FinOps Kubernetes security validation")
+PY
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 13. OPA POLICY ENFORCEMENT
+        // ================================================
+
+        stage('OPA Policy Enforcement') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    test -f policy/finops-security.rego
+
+                    for ENV in dev qa prod
+                    do
+
+                        echo "OPA policy validation: $ENV"
+
+                        conftest test \
+                            --policy policy \
+                            --output json \
+                            "$REPORT_DIR/finops-$ENV-rendered.yaml" \
+                            > "$REPORT_DIR/opa-$ENV-report.json"
+
+                        echo "PASS: $ENV OPA policies"
+
+                    done
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 14. GITLEAKS SECRET SCANNING
+        // ================================================
+
+        stage('Gitleaks Secret Scanning') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    gitleaks detect \
+                        --source . \
+                        --redact \
+                        --exit-code 1 \
+                        --report-format json \
+                        --report-path "$REPORT_DIR/gitleaks-report.json"
+
+                    echo "PASS: Gitleaks"
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 15. TRIVY CONFIGURATION SCANNING
+        // ================================================
+
+        stage('Trivy Configuration Scan') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    trivy config \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        --format json \
+                        --output "$REPORT_DIR/trivy-report.json" \
+                        .
+
+                    echo "PASS: Trivy configuration scan"
+                '''
+            }
+        }
+
+
+        // ================================================
+        // 16. RELEASE READINESS
+        // ================================================
+
+        stage('GitOps Release Readiness') {
+
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking required project directories..."
+
+                    for path in \
+                        argocd/projects \
+                        argocd/app-of-apps \
+                        argocd/applications/dev \
+                        argocd/applications/qa \
+                        argocd/applications/prod \
+                        platform/nodepools \
+                        platform/ec2nodeclasses \
+                        platform/karpenter/helm \
+                        platform/external-secrets \
+                        platform/monitoring/helm \
+                        applications/finops-engine/chart \
+                        policy \
+                        docs
+                    do
+
+                        test -d "$path"
+
+                        echo "PASS: $path"
+
+                    done
+
+
+                    echo "Checking required policy file..."
+
+                    test -f policy/finops-security.rego
+
+                    echo "PASS: OPA policy file"
+
+
+                    echo "Checking generated reports..."
+
+                    for ENV in dev qa prod
+                    do
+
+                        test -s "$REPORT_DIR/finops-$ENV-rendered.yaml"
+
+                        test -s "$REPORT_DIR/karpenter-$ENV-rendered.yaml"
+
+                        test -s "$REPORT_DIR/external-secrets-$ENV.yaml"
+
+                    done
+
+
+                    echo "PASS: GitOps release readiness"
+
+                '''
+            }
+        }
+
+    }
+
+
+    // ================================================
+    // POST BUILD ACTIONS
+    // ================================================
+
+    post {
+
+        always {
+
+            archiveArtifacts(
+                artifacts: 'ci-reports/**/*',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            echo 'GitOps pipeline completed'
+        }
+
+
+        success {
+
+            echo '''
+            ==========================================
+                 GITOPS CI PIPELINE SUCCESS
+            ==========================================
+
+            Checkout                     PASS
+            Toolchain                    PASS
+            YAML validation              PASS
+            External Secrets             PASS
+            Kustomize                    PASS
+            FinOps Helm                  PASS
+            Monitoring Helm              PASS
+            Karpenter Helm               PASS
+            Kubernetes schema            PASS
+            Karpenter resources          PASS
+            Argo CD configuration        PASS
+            FinOps security              PASS
+            OPA policy                   PASS
+            Gitleaks                     PASS
+            Trivy                        PASS
+            Release readiness            PASS
+
+            No Kubernetes deployment performed.
+
+            Argo CD remains responsible for CD.
+
+            ==========================================
+            '''
+        }
+
+
+        failure {
+
+            echo '''
+            ==========================================
+                 GITOPS CI PIPELINE FAILED
+            ==========================================
+
+            Review the failed Jenkins stage.
+
+            Inspect Jenkins console output.
+
+            Review security reports.
+
+            Do not bypass security failures.
+
+            ==========================================
+            '''
+        }
+
+
+        cleanup {
+
+            cleanWs(
+                deleteDirs: true,
+                notFailBuild: true
+            )
+        }
+    }
+}

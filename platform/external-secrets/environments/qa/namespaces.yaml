@@ -1,0 +1,25 @@
+---
+apiVersion: v1
+kind: Namespace
+
+metadata:
+  name: finops-qa
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+
+  labels:
+    environment: qa
+    app.kubernetes.io/part-of: gitops-karpenter-finops
+
+---
+apiVersion: v1
+kind: Namespace
+
+metadata:
+  name: monitoring
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+
+  labels:
+    environment: qa
+    app.kubernetes.io/part-of: gitops-karpenter-finops

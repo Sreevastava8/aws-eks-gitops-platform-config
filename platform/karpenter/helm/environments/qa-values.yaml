@@ -1,0 +1,9 @@
+---
+settings:
+  clusterName: gitops-karpenter-finops-qa
+  clusterEndpoint: "REPLACE_WITH_QA_EKS_CLUSTER_ENDPOINT"
+  interruptionQueue: "REPLACE_WITH_QA_KARPENTER_QUEUE_NAME"
+
+nodeSelector:
+  kubernetes.io/os: linux
+  eks.amazonaws.com/nodegroup: gitops-karpenter-finops-qa-system

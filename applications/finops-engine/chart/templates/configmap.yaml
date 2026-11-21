@@ -1,0 +1,13 @@
+{{- if .Values.configMap.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "finops-engine.fullname" . }}-config
+  labels:
+    {{- include "finops-engine.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.env.APP_ENV | quote }}
+  AWS_REGION: {{ .Values.env.AWS_REGION | quote }}
+  MOCK_EXTERNAL_SERVICES: {{ .Values.env.MOCK_EXTERNAL_SERVICES | quote }} 
+  PROMETHEUS_URL: {{ .Values.env.PROMETHEUS_URL | default "" | quote }} 
+{{- end }}

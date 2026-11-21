@@ -1,0 +1,27 @@
+---
+replicaCount: 2
+
+env:
+  APP_ENV: dev
+  LOG_LEVEL: DEBUG
+  AWS_REGION: ap-south-1
+  MOCK_EXTERNAL_SERVICES: "true"
+  PROMETHEUS_URL: "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
